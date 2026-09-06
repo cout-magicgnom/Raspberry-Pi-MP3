@@ -4,24 +4,49 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
-#include <conio.h>      // getch(), kbhit()  -> Windows. Ver nota no final do arquivo para Linux.
-#include <windows.h>    // Sleep(), FindFirstFile/FindNextFile, MAX_PATH
 #include "headers/estados.h"
 
 
 #ifdef _WIN32
     #include <windows.h>
+    #include <conio.h>
+
+    /* ---- Nomes usados no resto do arquivo, unificados por macro ---- */
+    #define STRCASECMP _stricmp
+    #define STRDUP     _strdup
 
     void sleep_ms(int ms) {
         Sleep(ms);
     }
 
-    void clear_console() {
+    void clear_console(void) {
         system("cls");
     }
 
+    /* Wrappers finos em cima do conio.h: no Windows, kbhit()/getch()
+       ja fazem exatamente o que precisamos (nao-bloqueante e leitura
+       crua de tecla), entao so damos nomes portaveis a eles. */
+    static int os_kbhit(void) { return _kbhit(); }
+    static int os_getch(void) { return _getch(); }
+
 #else
     #include <time.h>
+    #include <unistd.h>
+    #include <dirent.h>
+    #include <sys/stat.h>
+    #include <sys/select.h>
+    #include <termios.h>
+    #include <strings.h>
+    #include <limits.h>
+
+    /* ---- Equivalentes POSIX das funcoes/macros especificas do MSVC ---- */
+    #define STRCASECMP strcasecmp
+    #define STRDUP     strdup
+
+    /* MAX_PATH nao existe fora do Windows; usamos o equivalente do sistema. */
+    #ifndef MAX_PATH
+        #define MAX_PATH PATH_MAX
+    #endif
 
     void sleep_ms(int ms) {
         struct timespec ts;
@@ -32,31 +57,72 @@
         nanosleep(&ts, NULL);
     }
 
-    void clear_console() {
+    void clear_console(void) {
         system("clear");
+    }
+
+    static struct termios term_original;
+    static bool           term_configurado = false;
+
+    static void restaurarTerminal(void){
+        if (term_configurado){
+            tcsetattr(STDIN_FILENO, TCSANOW, &term_original);
+        }
+    }
+
+    static void configurarTerminalRaw(void){
+        if (term_configurado) return;
+
+        tcgetattr(STDIN_FILENO, &term_original);
+
+        struct termios raw = term_original;
+        raw.c_lflag &= ~(ICANON | ECHO);   // sem buffer de linha, sem eco
+        raw.c_iflag &= ~(ICRNL);           // Enter chega como '\r' (13), igual ao Windows
+        raw.c_cc[VMIN]  = 0;               // leitura nao-bloqueante...
+        raw.c_cc[VTIME] = 0;               // ...retorna na hora mesmo sem tecla
+
+        tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+        term_configurado = true;
+        atexit(restaurarTerminal);         // garante terminal normal ao fechar
+    }
+
+    /* Retorna 1 se ha uma tecla esperando para ser lida, sem consumi-la. */
+    static int os_kbhit(void){
+        configurarTerminalRaw();
+
+        fd_set fds;
+        struct timeval tv = {0, 0};
+        FD_ZERO(&fds);
+        FD_SET(STDIN_FILENO, &fds);
+
+        return select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0;
+    }
+
+    /* Le um unico byte cru do teclado (equivalente ao _getch() do Windows). */
+    static int os_getch(void){
+        configurarTerminalRaw();
+
+        unsigned char c;
+        if (read(STDIN_FILENO, &c, 1) == 1) return c;
+        return -1;
     }
 
 #endif
 
 
-
 /* ============================================================
    CONFIGURACAO MODULAR DOS BOTOES DE ACAO
-   Para trocar qual tecla ativa cada atalho, basta mudar o define
-   correspondente. Nao precisa mexer em mais nada no codigo.
    ============================================================ */
 #define TECLA_AUTOPLAY 'A'
 #define TECLA_PAUSE    'P'
 
-/* Teclas de navegacao (tambem podem ser remapeadas aqui) */
-#define TECLA_SETA_CIMA   72   // codigo estendido da seta para cima
-#define TECLA_SETA_BAIXO  80   // codigo estendido da seta para baixo
+/* Teclas de navegacao*/
+#define TECLA_SETA_CIMA   72
+#define TECLA_SETA_BAIXO  80
 #define TECLA_ENTER       13
 #define TECLA_ESC         27
 
-/* Pasta onde ficam os arquivos de musica da radio.
-   Basta soltar novos arquivos (.mp3/.wav/.ogg/.flac) aqui dentro -
-   nao precisa mexer no codigo nem recompilar para adicionar musicas. */
+/* Pasta onde ficam os arquivos de musica da radio. */
 #define DIRETORIO_MUSICAS "musicas/"
 
 typedef struct {
@@ -68,7 +134,7 @@ static ma_engine engine;
 static ma_sound  somAtual;
 static bool      somCarregado  = false;
 static int       indiceAtual   = -1;
-static bool      autoPlayAtivo = false;
+static bool      autoPlayAtivo = true;
 static bool      pausado       = false;
 
 //! Playlist dinamica de musicas carregadas do diretorio DIRETORIO_MUSICAS
@@ -106,10 +172,10 @@ static bool extensaoValida(const char *nome){
     const char *ponto = strrchr(nome, '.');
     if (!ponto) return false;
 
-    return (_stricmp(ponto, ".mp3")  == 0 ||
-            _stricmp(ponto, ".wav")  == 0 ||
-            _stricmp(ponto, ".ogg")  == 0 ||
-            _stricmp(ponto, ".flac") == 0);
+    return (STRCASECMP(ponto, ".mp3")  == 0 ||
+            STRCASECMP(ponto, ".wav")  == 0 ||
+            STRCASECMP(ponto, ".ogg")  == 0 ||
+            STRCASECMP(ponto, ".flac") == 0);
 }
 
 //! Gera um titulo 
@@ -136,7 +202,7 @@ static void adicionarMusica(const char *caminhoCompleto, const char *nomeArquivo
     if (totalMusicas >= capacidadeLista) return; // realloc falhou, aborta esta musica
 
     char *titulo  = gerarTitulo(nomeArquivo);
-    char *arquivo = _strdup(caminhoCompleto);
+    char *arquivo = STRDUP(caminhoCompleto);
 
     if (!titulo || !arquivo){
         free(titulo);
@@ -151,6 +217,8 @@ static void adicionarMusica(const char *caminhoCompleto, const char *nomeArquivo
 
 //! Varre DIRETORIO_MUSICAS e monta a playlist dinamicamente, uma musica
 //! por arquivo de audio encontrado.
+#ifdef _WIN32
+
 static void carregarPlaylistDoDiretorio(){
     char padraoBusca[MAX_PATH];
     snprintf(padraoBusca, sizeof(padraoBusca), "%s*.*", DIRETORIO_MUSICAS);
@@ -176,6 +244,40 @@ static void carregarPlaylistDoDiretorio(){
 
     FindClose(busca);
 }
+
+#else
+
+/* Equivalente Linux/Mac da varredura acima: FindFirstFile/FindNextFile
+   sao exclusivos da Win32 API, entao usamos opendir/readdir (POSIX),
+   com stat() para pular subdiretorios (o WIN32_FIND_DATA fazia isso
+   checando FILE_ATTRIBUTE_DIRECTORY; aqui o equivalente e S_ISDIR). */
+static void carregarPlaylistDoDiretorio(){
+    DIR *dir = opendir(DIRETORIO_MUSICAS);
+
+    if (dir == NULL){
+        printf("Aviso: nao foi possivel abrir o diretorio de musicas: %s\n", DIRETORIO_MUSICAS);
+        return;
+    }
+
+    struct dirent *entrada;
+    while ((entrada = readdir(dir)) != NULL){
+        if (strcmp(entrada->d_name, ".") == 0 || strcmp(entrada->d_name, "..") == 0) continue;
+
+        char caminhoCompleto[MAX_PATH];
+        snprintf(caminhoCompleto, sizeof(caminhoCompleto), "%s%s", DIRETORIO_MUSICAS, entrada->d_name);
+
+        struct stat info;
+        if (stat(caminhoCompleto, &info) == 0 && S_ISDIR(info.st_mode)) continue;
+
+        if (!extensaoValida(entrada->d_name)) continue;
+
+        adicionarMusica(caminhoCompleto, entrada->d_name);
+    }
+
+    closedir(dir);
+}
+
+#endif
 
 /* Libera toda a memoria alocada dinamicamente para a playlist.
    Chamada no encerramento do audio (audioClose). */
@@ -262,11 +364,49 @@ void playAudio(const char *arquivo){
     ma_engine_play_sound(&engine, arquivo, NULL);
 }
 
+//! Leitura de tecla com suporte a setas e ESC, independente do SO.
+#ifdef _WIN32
+
+static int lerTecla(void){
+    int tecla = os_getch();
+
+    if (tecla == 0 || tecla == 224){
+        tecla = os_getch(); // segundo byte = codigo real da tecla especial
+    }
+
+    return tecla;
+}
+
+#else
+
+static int lerTecla(void){
+    int c = os_getch();
+
+    if (c == 27){
+        /* Pode ser um ESC "puro" (usuario apertou ESC) ou o inicio de
+           uma sequencia de seta. Da uma pequena chance dos proximos
+           bytes chegarem antes de decidir. */
+        if (os_kbhit()){
+            int c2 = os_getch();
+            if (c2 == '[' && os_kbhit()){
+                int c3 = os_getch();
+                if (c3 == 'A') return TECLA_SETA_CIMA;
+                if (c3 == 'B') return TECLA_SETA_BAIXO;
+            }
+        }
+        return TECLA_ESC;
+    }
+
+    return c;
+}
+
+#endif
+
 /* ============================================================
    INTERFACE COM BOTOES 
    ============================================================ */
 
-static void desenharTela(int selecionado, int botaoAutoplay, int botaoPause, int botaoVoltar){
+static void desenharTela(int selecionado, int botaoAutoplay, int botaoPause, int botaoDesligar){
     clear_console();
 
     if (totalMusicas == 0){
@@ -292,7 +432,7 @@ static void desenharTela(int selecionado, int botaoAutoplay, int botaoPause, int
            pausado ? "RETOMAR" : "PAUSAR",
            TECLA_PAUSE);
 
-    printf("%s [ DESLIGAR ]\n", (selecionado == botaoVoltar) ? " >" : "  ");
+    printf("%s [ DESLIGAR ]\n", (selecionado == botaoDesligar) ? " >" : "  ");
 
     printf("\nSetas CIMA/BAIXO para navegar, ENTER para selecionar, ESC para voltar.\n");
 }
@@ -306,14 +446,14 @@ Estado radio(){
         playlistCarregada = true;
     }
 
-    const int botaoAutoplay = totalMusicas;
-    const int botaoPause    = totalMusicas + 1;
-    const int botaoVoltar   = totalMusicas + 2;
-    const int totalBotoes   = totalMusicas + 3;
+    const int botaoAutoplay  = totalMusicas;
+    const int botaoPause     = totalMusicas + 1;
+    const int botaoDesligar  = totalMusicas + 2;
+    const int totalBotoes    = totalMusicas + 3;
 
     int selecionado = 0;
 
-    desenharTela(selecionado, botaoAutoplay, botaoPause, botaoVoltar);
+    desenharTela(selecionado, botaoAutoplay, botaoPause, botaoDesligar);
 
     while (1){
 
@@ -322,52 +462,47 @@ Estado radio(){
         if (autoPlayAtivo && somCarregado && !pausado && ma_sound_at_end(&somAtual)){
             int proximo = (indiceAtual + 1) % totalMusicas;
             tocarMusica(proximo);
-            desenharTela(selecionado, botaoAutoplay, botaoPause, botaoVoltar);
+            desenharTela(selecionado, botaoAutoplay, botaoPause, botaoDesligar);
         }
 
-        if (kbhit()){
-            int tecla = getch();
+        if (os_kbhit()){
+            int tecla = lerTecla();
 
-            if (tecla == 0 || tecla == 224){
-                tecla = getch(); //! segundo byte das teclas especiais (setas)
-
-                if (tecla == TECLA_SETA_CIMA){
-                    selecionado = (selecionado - 1 + totalBotoes) % totalBotoes;
-                    desenharTela(selecionado, botaoAutoplay, botaoPause, botaoVoltar);
-                }
-                else if (tecla == TECLA_SETA_BAIXO){
-                    selecionado = (selecionado + 1) % totalBotoes;
-                    desenharTela(selecionado, botaoAutoplay, botaoPause, botaoVoltar);
-                }
+            if (tecla == TECLA_SETA_CIMA){
+                selecionado = (selecionado - 1 + totalMusicas) % totalMusicas;
+                tocarMusica(selecionado);
+                desenharTela(selecionado, botaoAutoplay, botaoPause, botaoDesligar);
+            }
+            else if (tecla == TECLA_SETA_BAIXO){
+                selecionado = (selecionado + 1) % totalMusicas;
+                tocarMusica(selecionado);
+                desenharTela(selecionado, botaoAutoplay, botaoPause, botaoDesligar);
             }
             else if (tecla == TECLA_ENTER){
-                if (selecionado < totalMusicas){
-                    printf("Reproduzindo: %s\n", radioPlaylist[selecionado].titulo);
+                if (selecionado < totalMusicas) {
                     tocarMusica(selecionado);
                 }
                 else if (selecionado == botaoAutoplay){
                     autoPlayAtivo = !autoPlayAtivo;
                 }
-                else if (selecionado == botaoPause){
-                    alternarPause();
-                }
-                else if (selecionado == botaoVoltar){
+
+                else if (selecionado == botaoDesligar){
                     return MENU; // Altere para o estado correto, se necessario
                 }
-                desenharTela(selecionado, botaoAutoplay, botaoPause, botaoVoltar);
+                desenharTela(selecionado, botaoAutoplay, botaoPause, botaoDesligar);
             }
             else if (tecla == TECLA_AUTOPLAY || tecla == (TECLA_AUTOPLAY + 32)){
                 //! Atalho direto: para mudar a tecla, basta alterar o #define 
                 //! TECLA_AUTOPLAY no topo do arquivo.
                 autoPlayAtivo = !autoPlayAtivo;
-                desenharTela(selecionado, botaoAutoplay, botaoPause, botaoVoltar);
+                desenharTela(selecionado, botaoAutoplay, botaoPause, botaoDesligar);
             }
             else if (tecla == TECLA_PAUSE || tecla == (TECLA_PAUSE + 32)){
                 //! Mesma logica do atalho de autoplay: funciona de
                 //! qualquer lugar do menu e a tecla e trocavel via
                 //! #define TECLA_PAUSE.
                 alternarPause();
-                desenharTela(selecionado, botaoAutoplay, botaoPause, botaoVoltar);
+                desenharTela(selecionado, botaoAutoplay, botaoPause, botaoDesligar);
             }
             else if (tecla == TECLA_ESC){
                 return MENU;
@@ -378,17 +513,3 @@ Estado radio(){
     }
 }
 
-/* ============================================================
-   NOTA SOBRE PORTABILIDADE
-   Este arquivo usa conio.h/windows.h (getch, kbhit, Sleep,
-   FindFirstFile/FindNextFile, _stricmp, _strdup), que sao
-   especificos do Windows - o padrao mais comum para esse tipo
-   de projeto em C com console. Se voce compilar em Linux/Mac,
-   sera preciso trocar:
-     - system("cls")        -> system("clear")
-     - getch()/kbhit()      -> uma implementacao equivalente com termios
-     - Sleep(ms)             -> usleep(ms * 1000) (de <unistd.h>)
-     - FindFirstFile/FindNextFile -> opendir/readdir (de <dirent.h>)
-     - _stricmp / _strdup   -> strcasecmp / strdup (de <strings.h>/<string.h>)
-   Se for esse o seu caso, me avise que eu adapto a versao inteira.
-   ============================================================ */
